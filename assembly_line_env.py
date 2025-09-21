@@ -3,93 +3,99 @@
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
-from simulation_model import AssemblyLineSim # Import our simulation engine
+from simulation_model import AssemblyLineSim, ORDER_BOOK_SIZE
 
 class AssemblyLineEnv(gym.Env):
     metadata = {'render_modes': ['human']}
 
     def __init__(self):
         super().__init__()
-        
-        # --- Define Action and Observation Spaces ---
-        # They must be gym.spaces objects
-        
-        # Example Action Space: Choose a priority rule
-        # Action 0: Default rule (High prio > Low prio)
-        # Action 1: Repaired parts get highest priority
-        self.action_space = spaces.Discrete(2)
-
-        # Example Observation Space: A vector of key metrics
-        # [buffer12_level, buffer23_level, station2_utilization, repair_station_utilization]
-        low_bounds = np.array([0, 0, 0, 0])
-        high_bounds = np.array([10, 10, 1, 1]) # Buffer capacity is 10, utilization is 0-1
-        self.observation_space = spaces.Box(low=low_bounds, high=high_bounds, dtype=np.float32)
-
-        # Initialize the simulation
+        self.action_space = spaces.MultiDiscrete([ORDER_BOOK_SIZE, 2])
+        obs_size = 2 + (ORDER_BOOK_SIZE * 3)
+        self.observation_space = spaces.Box(low=-1, high=1, shape=(obs_size,), dtype=np.float32)
         self.simulation = AssemblyLineSim()
-        self.step_duration = 60 # Each step in the RL env simulates 60 minutes
+        self.step_duration = 60
+        self.max_episode_steps = 1000
+        self.current_step = 0
 
     def _get_obs(self):
-        kpis = self.simulation.get_kpis()
-        # Important: The observation must be a NumPy array
-        return np.array([
-            kpis["buffer_12_level"],
-            kpis["buffer_23_level"],
-            kpis["station_2_utilization"],
-            kpis["repair_station_utilization"]
-        ], dtype=np.float32)
+        obs_data, _ = self.simulation.get_kpis_and_state()
+        b12_level_norm = obs_data["buffer_12_level"] / self.simulation.BUFFER_CAPACITY
+        b23_level_norm = obs_data["buffer_23_level"] / self.simulation.BUFFER_CAPACITY
+        obs_vector = [b12_level_norm, b23_level_norm]
+        for i in range(ORDER_BOOK_SIZE):
+            if i < len(obs_data["order_book"]):
+                part = obs_data["order_book"][i]
+                type_id_norm = part['config']['type_id'] / 2.0
+                priority_norm = (part['priority'] - 1.5) / 0.5
+                time_to_due_norm = max(-1, (part['due_date'] - self.simulation.env.now) / 720.0)
+                obs_vector.extend([type_id_norm, priority_norm, time_to_due_norm])
+            else:
+                obs_vector.extend([0, 0, 0])
+        return np.array(obs_vector, dtype=np.float32)
 
     def reset(self, seed=None, options=None):
-        super().reset(seed=seed) # Required by the latest gym API
-        
-        # Reset the simulation to its initial state
+        super().reset(seed=seed)
         self.simulation.setup_simulation()
-        self.last_parts_completed = 0
-        
+        self.current_step = 0
         observation = self._get_obs()
-        info = {} # You can pass extra info here if needed
+        info = {}
         return observation, info
 
-    def step(self, action):
-        # --- 1. Take Action ---
-        # The agent's action doesn't directly control the sim in this example.
-        # It would be used to change rules, e.g., self.simulation.set_priority_rule(action)
-        # For now, we'll keep it simple and the action won't do anything.
-        # We will add its effect in the next phase.
 
-        # --- 2. Run the Simulation for one step duration ---
+    def step(self, action):
+        part_choice, flow_choice = action
+        self.simulation.set_source_status(bool(flow_choice))
+        if not bool(flow_choice):
+            self.simulation.release_part(part_choice)
+
         self.simulation.run(duration=self.step_duration)
 
-        # --- 3. Get the New State (Observation) ---
-        observation = self._get_obs()
+        obs_data, results = self.simulation.get_kpis_and_state()
+        
+        # This part of building the observation is correct
+        b12_level_norm = obs_data["buffer_12_level"] / self.simulation.BUFFER_CAPACITY
+        b23_level_norm = obs_data["buffer_23_level"] / self.simulation.BUFFER_CAPACITY
+        obs_vector = [b12_level_norm, b23_level_norm]
+        for i in range(ORDER_BOOK_SIZE):
+            if i < len(obs_data["order_book"]):
+                part = obs_data["order_book"][i]
+                type_id_norm = part['config']['type_id'] / 2.0
+                priority_norm = (part['priority'] - 1.5) / 0.5
+                time_to_due_norm = max(-1, (part['due_date'] - self.simulation.env.now) / 720.0)
+                obs_vector.extend([type_id_norm, priority_norm, time_to_due_norm])
+            else:
+                obs_vector.extend([0, 0, 0])
+        observation = np.array(obs_vector, dtype=np.float32)
 
-        # --- 4. Calculate the Reward ---
-        current_kpis = self.simulation.get_kpis()
+        # --- RE-BALANCED Value-Based Reward ---
+        reward = 0.0
+        cycle_times_high = []
+        cycle_times_low = []
+        for part in results["newly_completed_parts"]:
+            if part['priority'] == 1: # HIGH priority
+                if part['is_late']:
+                    reward -= 5.0 # MODIFIED: Penalty is smaller, less terrifying
+                else:
+                    reward += 15.0 # NEW: Big reward for ON-TIME high-prio parts
+                cycle_times_high.append(part['cycle_time'])
+            else: # LOW priority
+                reward += 2.0 # reward for low-prio
+                cycle_times_low.append(part['cycle_time'])
         
-        # Reward for new parts produced in this step
-        newly_completed_parts = current_kpis["parts_completed_total"] - self.last_parts_completed
-        self.last_parts_completed = current_kpis["parts_completed_total"]
-        
-        # Penalty for high WIP (work-in-progress)
-        wip = current_kpis["buffer_12_level"] + current_kpis["buffer_23_level"]
-        
-        # The Reward Function
-        reward = (newly_completed_parts * 10) - (wip * 0.5)
+        wip_level = obs_data["buffer_12_level"] / self.simulation.BUFFER_CAPACITY + obs_data["buffer_23_level"] / self.simulation.BUFFER_CAPACITY
+        reward -= wip_level * 0.025 # Wip penality 
 
-        # --- 5. Check for Termination ---
-        # In our continuous simulation, it never truly "ends"
+        if bool(flow_choice): reward -= 0.5# inaction penality 
+        final_reward = float(reward)
+
+        self.current_step += 1
         terminated = False
-        truncated = False
+        truncated = self.current_step >= self.max_episode_steps
+        info = {
+            'cycle_times_high': cycle_times_high, 
+            'cycle_times_low': cycle_times_low,
+            'newly_completed_parts': results["newly_completed_parts"]
+        }
         
-        info = {}
-        
-        return observation, reward, terminated, truncated, info
-
-    def render(self):
-        # For now, just print the KPIs to the console
-        kpis = self.simulation.get_kpis()
-        print(f"Time: {self.simulation.env.now:.2f} | WIP: {kpis['buffer_12_level'] + kpis['buffer_23_level']} | Completed: {kpis['parts_completed_total']}")
-
-    def close(self):
-        # Clean up any resources if needed
-        pass
+        return observation, final_reward, terminated, truncated, info

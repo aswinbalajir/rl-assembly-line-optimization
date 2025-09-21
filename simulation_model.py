@@ -5,32 +5,29 @@ import random
 import statistics
 import numpy as np
 
+ORDER_BOOK_SIZE = 10
+
 class AssemblyLineSim:
     def __init__(self):
-        # --- Simulation Parameters ---
         self.BUFFER_CAPACITY = 10
         self.INTER_ARRIVAL_TIME = 12
         self.FAIL_RATE = 0.08
         self.REPAIR_TIME = 30
-
         self.PART_CONFIGS = {
-            'Type_A': {'s1_time': 10, 's2_time': 20, 's3_time': 8},
-            'Type_B': {'s1_time': 12, 's2_time': 25, 's3_time': 7},
-            'Type_C': {'s1_time': 8,  's2_time': 18, 's3_time': 9},
+            'Type_A': {'s1_time': 10, 's2_time': 20, 's3_time': 8, 'type_id': 0},
+            'Type_B': {'s1_time': 12, 's2_time': 25, 's3_time': 7, 'type_id': 1},
+            'Type_C': {'s1_time': 8,  's2_time': 18, 's3_time': 9, 'type_id': 2},
         }
         self.PART_MIX = {'Type_A': 0.60, 'Type_B': 0.25, 'Type_C': 0.15}
         self.PART_TYPES = list(self.PART_MIX.keys())
         self.PART_PROBABILITIES = list(self.PART_MIX.values())
-        
         self.PRIORITY_MIX = {'HIGH': 0.20, 'LOW': 0.80}
         self.PRIORITY_MAP = {'HIGH': 1, 'LOW': 2}
         
         self.setup_simulation()
 
     def setup_simulation(self):
-        """Initializes or resets the simulation environment and data structures."""
         self.env = simpy.Environment()
-        
         self.stations = {
             'station1': simpy.PriorityResource(self.env, capacity=1),
             'station2': simpy.PriorityResource(self.env, capacity=1),
@@ -38,80 +35,105 @@ class AssemblyLineSim:
             'repair_station': simpy.PriorityResource(self.env, capacity=1)
         }
         self.buffers = {
-            'buffer12': simpy.Container(self.env, capacity=self.BUFFER_CAPACITY, init=0),
-            'buffer23': simpy.Container(self.env, capacity=self.BUFFER_CAPACITY, init=0)
+            'buffer12': simpy.Store(self.env, capacity=self.BUFFER_CAPACITY),
+            'buffer23': simpy.Store(self.env, capacity=self.BUFFER_CAPACITY)
         }
         
-        # --- Data Collection ---
-        self.parts_completed_total = 0
+        self.completed_parts = []
+        self.source_halted = False
         self.station_busy_time = {name: 0 for name in self.stations.keys()}
-        self.last_observation_time = 0
 
-        # Start the simulation processes
-        self.env.process(self._part_source())
+        self.parts_processed_per_station = {'station1': 0, 'station2': 0, 'station3': 0}
 
-    def _part_process(self, part_name, part_priority, part_config):
-        # This is the same logic as before, just as a method of the class
-        with self.stations['station1'].request(priority=part_priority) as req:
+        self.order_book = []
+        self.part_id_counter = 0
+        self._fill_order_book()
+
+    def _fill_order_book(self):
+        while len(self.order_book) < ORDER_BOOK_SIZE:
+            self.part_id_counter += 1
+            part_type = np.random.choice(self.PART_TYPES, p=self.PART_PROBABILITIES)
+            priority_name = np.random.choice(list(self.PRIORITY_MIX.keys()), p=list(self.PRIORITY_MIX.values()))
+            priority = self.PRIORITY_MAP[priority_name]
+            due_date = self.env.now + (240 if priority == 1 else 720)
+            part = {
+                "id": self.part_id_counter, "type": part_type, "config": self.PART_CONFIGS[part_type],
+                "priority": priority, "arrival_time": self.env.now, "due_date": due_date
+            }
+            self.order_book.append(part)
+
+    def release_part(self, order_index):
+        if not self.source_halted and self.order_book and 0 <= order_index < len(self.order_book):
+            part_to_release = self.order_book.pop(order_index)
+            self.env.process(self._part_process(part_to_release))
+            self._fill_order_book()
+
+# In simulation_model.py
+
+    def _part_process(self, part):
+        arrival_time = self.env.now
+        request_priority = part['priority']
+
+        # --- Station 1 ---
+        with self.stations['station1'].request(priority=request_priority) as req:
             yield req
             start_proc_time = self.env.now
-            yield self.env.timeout(part_config['s1_time'])
+            yield self.env.timeout(part['config']['s1_time'])
             self.station_busy_time['station1'] += self.env.now - start_proc_time
+        
+        yield self.buffers['buffer12'].put(part)
 
-        yield self.buffers['buffer12'].put(1)
-
+        # --- Station 2 & Repair Loop ---
         tested_successfully = False
         while not tested_successfully:
-            with self.stations['station2'].request(priority=part_priority) as req:
+            part_from_buffer = yield self.buffers['buffer12'].get()
+            with self.stations['station2'].request(priority=request_priority) as req:
                 yield req
-                yield self.buffers['buffer12'].get(1)
                 start_proc_time = self.env.now
-                yield self.env.timeout(part_config['s2_time'])
+                yield self.env.timeout(part_from_buffer['config']['s2_time'])
                 self.station_busy_time['station2'] += self.env.now - start_proc_time
 
+            # CRITICAL FIX: Re-introducing the failure check logic
             if random.random() > self.FAIL_RATE:
                 tested_successfully = True
-                yield self.buffers['buffer23'].put(1)
+                self.parts_processed_per_station['station2'] += 1
+                yield self.buffers['buffer23'].put(part_from_buffer)
             else:
-                with self.stations['repair_station'].request(priority=part_priority) as repair_req:
+                # Part failed, send to repair
+                with self.stations['repair_station'].request(priority=request_priority) as repair_req:
                     yield repair_req
                     start_repair_time = self.env.now
                     yield self.env.timeout(self.REPAIR_TIME)
                     self.station_busy_time['repair_station'] += self.env.now - start_repair_time
-                yield self.buffers['buffer12'].put(1)
-
-        with self.stations['station3'].request(priority=part_priority) as req:
+                # After repair, it goes back into the queue for Station 2
+                yield self.buffers['buffer12'].put(part_from_buffer)
+        
+        # --- Station 3 ---
+        part_from_buffer_2 = yield self.buffers['buffer23'].get()
+        with self.stations['station3'].request(priority=request_priority) as req:
             yield req
-            yield self.buffers['buffer23'].get(1)
             start_proc_time = self.env.now
-            yield self.env.timeout(part_config['s3_time'])
+            yield self.env.timeout(part_from_buffer_2['config']['s3_time'])
             self.station_busy_time['station3'] += self.env.now - start_proc_time
         
-        self.parts_completed_total += 1
+        # --- Final Recording ---
+        part['finish_time'] = self.env.now
+        part['cycle_time'] = part['finish_time'] - part['arrival_time']
+        part['is_late'] = part['finish_time'] > part['due_date']
+        self.completed_parts.append(part)
 
-    def _part_source(self):
-        part_id = 0
-        while True:
-            yield self.env.timeout(random.expovariate(1.0 / self.INTER_ARRIVAL_TIME))
-            part_id += 1
-            part_type = np.random.choice(self.PART_TYPES, p=self.PART_PROBABILITIES)
-            part_config = self.PART_CONFIGS[part_type]
-            priority_name = np.random.choice(list(self.PRIORITY_MIX.keys()), p=list(self.PRIORITY_MIX.values()))
-            part_priority = self.PRIORITY_MAP[priority_name]
-            part_name = f"Part-{part_id}({part_type}, P{part_priority})"
-            self.env.process(self._part_process(part_name, part_priority, part_config))
-
-    def get_kpis(self):
-        """Calculates and returns the current KPIs of the system."""
-        # This is a simplified KPI snapshot for the RL state
-        return {
-            "buffer_12_level": self.buffers['buffer12'].level,
-            "buffer_23_level": self.buffers['buffer23'].level,
-            "station_2_utilization": (self.station_busy_time['station2'] / (self.env.now + 1e-6)),
-            "repair_station_utilization": (self.station_busy_time['repair_station'] / (self.env.now + 1e-6)),
-            "parts_completed_total": self.parts_completed_total
+    def get_kpis_and_state(self):
+        obs = {
+            "buffer_12_level": len(self.buffers['buffer12'].items),
+            "buffer_23_level": len(self.buffers['buffer23'].items),
+            "order_book": self.order_book
         }
+        results = { "newly_completed_parts": self.completed_parts }
+        self.completed_parts = []
+        return obs, results
+
+    def set_source_status(self, halt_status):
+        self.source_halted = halt_status
 
     def run(self, duration):
-        """Runs the simulation for a given duration."""
         self.env.run(until=self.env.now + duration)
