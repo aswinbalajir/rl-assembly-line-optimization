@@ -24,7 +24,7 @@ class AssemblyLineEnv(gym.Env):
         obs_size = 2 + (ORDER_BOOK_SIZE * 3) + 3
         self.observation_space = spaces.Box(low=-1, high=1, shape=(obs_size,), dtype=np.float32)
         
-        self.step_duration = 60
+        self.step_duration = 30
         self.max_episode_steps = 1000
         self.current_step = 0
 
@@ -103,32 +103,7 @@ class AssemblyLineEnv(gym.Env):
 
         # --- Get State and Results ---
         obs_data, results = self.simulation.get_kpis_and_state()
-        
-        # --- Build the Observation Vector ---
-        b12_level_norm = obs_data["buffer_12_level"] / self.simulation.BUFFER_CAPACITY
-        b23_level_norm = obs_data["buffer_23_level"] / self.simulation.BUFFER_CAPACITY
-        obs_vector = [b12_level_norm, b23_level_norm]
-        
-        for i in range(ORDER_BOOK_SIZE):
-            if i < len(obs_data["order_book"]):
-                part = obs_data["order_book"][i]
-                type_id_norm = part['config']['type_id'] / 2.0
-                priority_norm = (part['priority'] - 1.5) / 0.5
-                time_to_due_norm = max(-1, (part['due_date'] - self.simulation.env.now) / 720.0)
-                obs_vector.extend([type_id_norm, priority_norm, time_to_due_norm])
-            else:
-                obs_vector.extend([0, 0, 0])
-        
-        # --- THIS IS THE MISSING PART IN YOUR CURRENT STEP FUNCTION ---
-        time_of_day = self.simulation.env.now % MINS_IN_DAY
-        day_of_week = (self.simulation.env.now // MINS_IN_DAY) % 7
-        time_of_day_sin = np.sin(2 * np.pi * time_of_day / MINS_IN_DAY)
-        time_of_day_cos = np.cos(2 * np.pi * time_of_day / MINS_IN_DAY)
-        day_of_week_norm = day_of_week / 6.0
-        obs_vector.extend([time_of_day_sin, time_of_day_cos, day_of_week_norm])
-        # --- END OF MISSING PART ---
-
-        observation = np.array(obs_vector, dtype=np.float32)
+        observation = self._get_obs()
 
         # --- Calculate Reward ---
         reward = 0.0
@@ -147,7 +122,7 @@ class AssemblyLineEnv(gym.Env):
         
         wip_level = observation[0] + observation[1]
         reward -= wip_level * 0.1
-        if bool(flow_choice): reward -= 1.0
+        if bool(flow_choice): reward -= 2.0
         if bool(overtime_choice): reward -= 20.0
         final_reward = float(reward)
 
@@ -155,11 +130,15 @@ class AssemblyLineEnv(gym.Env):
         self.current_step += 1
         terminated = False
         truncated = self.current_step >= self.max_episode_steps
+        
         info = {
             'cycle_times_high': cycle_times_high, 
             'cycle_times_low': cycle_times_low,
             'newly_completed_parts': results["newly_completed_parts"],
-            'overtime_active': bool(overtime_choice)
+            'buffer_12_level': obs_data['buffer_12_level'],
+            'buffer_23_level': obs_data['buffer_23_level'],
+            'events': results['events'],
+            'parts_in_stations': obs_data['parts_in_stations'] # <-- ADD THIS LINE
         }
         
         return observation, final_reward, terminated, truncated, info

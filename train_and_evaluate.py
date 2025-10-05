@@ -134,8 +134,11 @@ if __name__ == "__main__":
     eval_callback = EvalCallback(eval_env, best_model_save_path='./best_model/',
                                  log_path='./best_model/', eval_freq=10000,
                                  deterministic=True, render=False)
+    # Define a larger network architecture
+    # pi = policy network (actor), vf = value network (critic)
+    policy_kwargs = dict(net_arch=dict(pi=[128, 128], vf=[128, 128]))
 
-    model = PPO("MlpPolicy", train_env, verbose=1, tensorboard_log=log_dir,
+    model = PPO("MlpPolicy", train_env,policy_kwargs=policy_kwargs, verbose=1, tensorboard_log=log_dir,
                 learning_rate=5e-5, n_steps=1024, batch_size=64, n_epochs=10, gamma=0.99, device='cpu')
     
     # The agent is trained on the randomized environment, but the callback saves the best performer.
