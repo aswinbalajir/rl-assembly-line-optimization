@@ -15,12 +15,10 @@ class AssemblyLineEnv(gym.Env):
         self.randomize = randomize
         self.simulation = AssemblyLineSim(part_mix=part_mix, priority_mix=priority_mix, fail_rate=fail_rate)
         
-        # MODIFIED: Action space now includes the overtime decision
-        # [part_choice, flow_control, overtime_choice]
+        # Action space includes [part_choice, flow_control, overtime_choice]
         self.action_space = spaces.MultiDiscrete([ORDER_BOOK_SIZE, 2, 2])
 
-        # MODIFIED: Observation space now includes time of day and day of week
-        # [buffer_lvls, order_book_features, time_of_day, day_of_week]
+        # Observation space includes [buffer_lvls, order_book_features, time_of_day, day_of_week]
         obs_size = 2 + (ORDER_BOOK_SIZE * 3) + 3
         self.observation_space = spaces.Box(low=-1, high=1, shape=(obs_size,), dtype=np.float32)
         
